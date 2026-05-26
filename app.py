@@ -8,6 +8,7 @@ import json
 import hashlib
 import hmac as hmac_lib
 import threading
+import traceback
 import urllib.request as urllib_req
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -21,7 +22,7 @@ from email_sender import (
     send_resolved_email,
     send_reassign_notification_email,
 )
-from sheets_logger import log_issue, update_issue_status
+from sheets_logger import log_issue, batch_update_issue
 
 load_dotenv()
 
@@ -29,7 +30,6 @@ app = Flask(__name__)
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 signature_verifier = SignatureVerifier(os.environ["SLACK_SIGNING_SECRET"])
 
-# Get workspace team ID once at startup (needed for Slack deep links)
 try:
     _auth = slack_client.auth_test()
     SLACK_TEAM_ID = _auth["team_id"]
@@ -40,6 +40,8 @@ except Exception as _e:
 
 ISSUES_FILE = os.path.join(os.path.dirname(__file__), "issues.json")
 _save_lock = threading.Lock()
+
+_event_ids_lock = threading.Lock()
 processed_event_ids = set()
 
 _issue_counter = 0
@@ -79,9 +81,10 @@ issues = _load_issues()
 if issues:
     _issue_counter = max(int(k.split("-")[1]) for k in issues)
 
-# ── Slack users cache (refreshed every 5 min in background) ──────────────────
+# ── Slack users cache (refreshed every 5 min) ────────────────────────────────
 _users_cache = []
 _users_cache_lock = threading.Lock()
+
 
 def _refresh_users_cache():
     global _users_cache
@@ -110,15 +113,22 @@ def _refresh_users_cache():
     except Exception as e:
         print(f"Failed to refresh users cache: {e}")
 
+
 def _schedule_users_cache():
-    """Refresh users cache now and every 5 minutes."""
     _refresh_users_cache()
     t = threading.Timer(300, _schedule_users_cache)
     t.daemon = True
     t.start()
 
-# Kick off cache refresh at startup
+
 threading.Thread(target=_schedule_users_cache, daemon=True).start()
+
+# ── Channel name cache ────────────────────────────────────────────────────────
+_channel_cache = {}
+
+# ── Public URL cache ──────────────────────────────────────────────────────────
+_public_url_cache = None
+_public_url_lock = threading.Lock()
 
 EMAIL_WHITELIST = {
     "Ashish Chakor",
@@ -144,6 +154,12 @@ SKIP_PHRASES = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_user_info(user_id):
+    # Check cache first — avoids a live Slack API call on every message
+    with _users_cache_lock:
+        for u in _users_cache:
+            if u["id"] == user_id:
+                return u["name"], u["email"]
+    # Fallback to live API if not in cache yet (startup race or new user)
     try:
         res = slack_client.users_info(user=user_id)
         user = res["user"]
@@ -156,15 +172,18 @@ def get_user_info(user_id):
 
 
 def get_slack_users():
-    """Return cached list of active non-bot workspace users: [{id, name, email}]."""
     with _users_cache_lock:
         return list(_users_cache)
 
 
 def get_channel_name(channel_id):
+    if channel_id in _channel_cache:
+        return _channel_cache[channel_id]
     try:
         res = slack_client.conversations_info(channel=channel_id)
-        return "#" + res["channel"].get("name", channel_id)
+        name = "#" + res["channel"].get("name", channel_id)
+        _channel_cache[channel_id] = name
+        return name
     except Exception:
         return channel_id
 
@@ -202,17 +221,24 @@ def get_issue_type(text):
 
 
 def get_public_url():
-    # Support env var (Railway/production) or ngrok (local)
-    url = os.environ.get("PUBLIC_URL", "")
-    if url:
-        return url if url.startswith("https://") else "https://" + url
-    try:
-        with urllib_req.urlopen("http://localhost:4040/api/tunnels", timeout=2) as r:
-            data = json.loads(r.read())
-            url = data["tunnels"][0]["public_url"]
-            return url if url.startswith("https://") else "https://" + url[7:]
-    except Exception:
-        return None
+    global _public_url_cache
+    with _public_url_lock:
+        if _public_url_cache:
+            return _public_url_cache
+        url = os.environ.get("PUBLIC_URL", "")
+        if url:
+            result = url if url.startswith("https://") else "https://" + url
+            _public_url_cache = result
+            return result
+        try:
+            with urllib_req.urlopen("http://localhost:4040/api/tunnels", timeout=2) as r:
+                data = json.loads(r.read())
+                raw = data["tunnels"][0]["public_url"]
+                result = raw if raw.startswith("https://") else "https://" + raw[7:]
+                _public_url_cache = result
+                return result
+        except Exception:
+            return None
 
 
 def generate_email_token(issue_id: str, action: str) -> str:
@@ -246,7 +272,7 @@ def _issue_blocks(issue_id, assigned_to_name, description, status):
             })
         elements.append({
             "type": "button",
-            "text": {"type": "plain_text", "text": "Mark Done"},
+            "text": {"type": "plain_text", "text": "Done"},
             "style": "primary",
             "action_id": "done_task",
             "value": issue_id,
@@ -257,7 +283,6 @@ def _issue_blocks(issue_id, assigned_to_name, description, status):
 
 
 def post_issue_notification(channel, issue_id, description, assigned_to_name, issue_type):
-    """Post issue card to Slack on creation only. Returns message ts."""
     label = "Query" if issue_type == "Query" else "Issue"
     result = slack_client.chat_postMessage(
         channel=channel,
@@ -283,16 +308,13 @@ def _update_slack_message(issue_id, status):
 
 
 def _build_action_urls(public_url, issue_id, raiser_id=""):
-    """Build all email action URLs for an issue."""
     if not public_url:
         return None, None, None, None
     accept_token   = generate_email_token(issue_id, "accept")
     reassign_token = generate_email_token(issue_id, "reassign")
     done_token     = generate_email_token(issue_id, "done")
-    # Ask Question — https link to bot which instantly redirects to Slack (email clients block slack://)
-    ask_token = generate_email_token(issue_id, "ask")
-    ask_url = (f"{public_url}/email/ask-redirect?issue_id={issue_id}&token={ask_token}"
-               if public_url else None)
+    ask_token      = generate_email_token(issue_id, "ask")
+    ask_url = f"{public_url}/email/ask-redirect?issue_id={issue_id}&token={ask_token}"
     return (
         f"{public_url}/email/action?issue_id={issue_id}&action=accept&token={accept_token}",
         f"{public_url}/email/reassign-form?issue_id={issue_id}&token={reassign_token}",
@@ -314,11 +336,14 @@ def _process_accepted(issue_id, actor_name):
     issue["status"] = "Accepted"
     issue["working_started_time"] = now
 
-    # Update Slack instantly before slow operations
+    # Update Slack card instantly — user sees change before any slow I/O
     _update_slack_message(issue_id, "Accepted")
 
-    update_issue_status(issue_id, "working_started_time", now)
-    update_issue_status(issue_id, "status", "Accepted")
+    # Single Sheets API call for both fields
+    batch_update_issue(issue_id, {
+        "working_started_time": now,
+        "status": "Accepted",
+    })
 
     sent = issue.setdefault("action_emails_sent", set())
     thread_id = issue.get("thread_message_id")
@@ -337,7 +362,7 @@ def _process_accepted(issue_id, actor_name):
         issue["accept_message_id"] = accept_msg_id
 
     _save_issues()
-    print(f"{issue_id} status -> Accepted by {actor_name}")
+    print(f"{issue_id} -> Accepted by {actor_name}")
 
 
 def _process_done(issue_id, completion_message, actor_name):
@@ -358,13 +383,16 @@ def _process_done(issue_id, completion_message, actor_name):
     except Exception:
         issue["resolution_duration"] = "N/A"
 
-    # Update Slack instantly before slow operations
+    # Update Slack card instantly — user sees change before any slow I/O
     _update_slack_message(issue_id, "Resolved")
 
-    update_issue_status(issue_id, "completion_time", now)
-    update_issue_status(issue_id, "status", "Resolved")
-    update_issue_status(issue_id, "resolution_duration", issue["resolution_duration"])
-    update_issue_status(issue_id, "completion_message", completion_message)
+    # Single Sheets API call for all four fields
+    batch_update_issue(issue_id, {
+        "completion_time": now,
+        "status": "Resolved",
+        "resolution_duration": issue["resolution_duration"],
+        "completion_message": completion_message,
+    })
 
     sent = issue.setdefault("action_emails_sent", set())
     thread_id = issue.get("thread_message_id")
@@ -387,7 +415,7 @@ def _process_done(issue_id, completion_message, actor_name):
         )
 
     _save_issues()
-    print(f"{issue_id} status -> Resolved by {actor_name}")
+    print(f"{issue_id} -> Resolved by {actor_name}")
 
 
 def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
@@ -404,28 +432,33 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
     old_assignee_name  = issue["assigned_to"]
     old_assignee_email = issue["assigned_to_email"]
 
-    # Update issue dict
-    issue["reassigned_from"]    = old_assignee_name
+    issue["reassigned_from"]     = old_assignee_name
     issue["reassignment_reason"] = reason
-    issue["reassignment_time"]  = now
-    issue["assigned_to"]        = new_assignee_name
-    issue["assigned_to_email"]  = new_assignee_email
-    issue["assigned_to_id"]     = new_assignee_id
-    issue["status"]             = ""
+    issue["reassignment_time"]   = now
+    issue["assigned_to"]         = new_assignee_name
+    issue["assigned_to_email"]   = new_assignee_email
+    issue["assigned_to_id"]      = new_assignee_id
+    issue["status"]              = ""
     issue["working_started_time"] = ""
     issue.setdefault("action_emails_sent", set()).discard("accepted")
     issue["action_emails_sent"].discard("resolved")
 
-    # Update Google Sheets
-    update_issue_status(issue_id, "assigned_to",          new_assignee_name)
-    update_issue_status(issue_id, "reassigned_from",      old_assignee_name)
-    update_issue_status(issue_id, "reassignment_reason",  reason)
-    update_issue_status(issue_id, "reassignment_time",    now)
-    update_issue_status(issue_id, "status",               "Reassigned")
+    # Update Slack card instantly — user sees change before any slow I/O
+    _update_slack_message(issue_id, "Reassigned")
 
-    # Send new assignment email to new assignee
+    # Single Sheets API call for all five fields
+    batch_update_issue(issue_id, {
+        "assigned_to":         new_assignee_name,
+        "reassigned_from":     old_assignee_name,
+        "reassignment_reason": reason,
+        "reassignment_time":   now,
+        "status":              "Reassigned",
+    })
+
     public_url = get_public_url()
-    accept_url, reassign_url, done_url, ask_url = _build_action_urls(public_url, issue_id, issue.get("raised_by_id", ""))
+    accept_url, reassign_url, done_url, ask_url = _build_action_urls(
+        public_url, issue_id, issue.get("raised_by_id", "")
+    )
     thread_id = issue.get("thread_message_id")
 
     if new_assignee_name in EMAIL_WHITELIST:
@@ -448,7 +481,6 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
         )
         issue["thread_message_id"] = new_msg_id
 
-        # Notify raiser (CC old assignee)
         send_reassign_notification_email(
             to_email=issue["raised_by_email"],
             raised_by=issue["raised_by"],
@@ -464,9 +496,19 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
     else:
         print(f"Skipping reassign emails for {new_assignee_name} (not in whitelist)")
 
-    _update_slack_message(issue_id, "Reassigned")
     _save_issues()
     print(f"{issue_id} reassigned from {old_assignee_name} -> {new_assignee_name}")
+
+
+def _send_assignment_email_bg(issue_id, email_kwargs):
+    """Background helper: send assignment email and store thread_message_id."""
+    try:
+        msg_id = send_assignment_email(**email_kwargs)
+        if issue_id in issues:
+            issues[issue_id]["thread_message_id"] = msg_id
+            _save_issues()
+    except Exception as e:
+        print(f"[ERROR] Assignment email failed for {issue_id}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -494,11 +536,12 @@ def slack_events():
     event = payload.get("event", {})
     event_id = payload.get("event_id", "")
 
-    if event_id in processed_event_ids:
-        return jsonify({"ok": True})
-    processed_event_ids.add(event_id)
-    if len(processed_event_ids) > 2000:
-        processed_event_ids.clear()
+    with _event_ids_lock:
+        if event_id in processed_event_ids:
+            return jsonify({"ok": True})
+        processed_event_ids.add(event_id)
+        if len(processed_event_ids) > 2000:
+            processed_event_ids.clear()
 
     if (
         event.get("type") == "message"
@@ -514,7 +557,6 @@ def handle_new_message(event):
     try:
         _handle_new_message_inner(event)
     except Exception as e:
-        import traceback
         print(f"[ERROR] handle_new_message crashed: {e}")
         traceback.print_exc()
 
@@ -526,7 +568,6 @@ def _handle_new_message_inner(event):
         print(f"Skipped thread reply in {event.get('channel')}")
         return
 
-    # Use only the typed text — ignore file/image attachment content
     text = event.get("text", "")
     channel = event.get("channel", "")
     user_id = event.get("user", "")
@@ -546,7 +587,7 @@ def _handle_new_message_inner(event):
     description = clean_slack_text(text)
     issue_type = get_issue_type(text)
     public_url = get_public_url()
-    print(f"Raiser: {raiser_name} <{raiser_email}> | Public URL: {public_url}")
+    print(f"Raiser: {raiser_name} | Channel: {channel_name} | URL: {public_url}")
 
     for assignee_id in mentions:
         assignee_name, assignee_email = get_user_info(assignee_id)
@@ -586,9 +627,17 @@ def _handle_new_message_inner(event):
             "slack_ts": None,
         }
 
+        # Post Slack card immediately — don't wait for email
+        slack_ts = post_issue_notification(channel, issue_id, description, assignee_name, issue_type)
+        issues[issue_id]["slack_ts"] = slack_ts
+        _save_issues()
+
+        # Log to Sheets in background
+        threading.Thread(target=log_issue, args=(dict(issues[issue_id]),), daemon=True).start()
+
+        # Send assignment email in background — saves thread_message_id when done
         if assignee_name in EMAIL_WHITELIST:
-            print(f"Sending assignment email to {assignee_email}...")
-            msg_id = send_assignment_email(
+            email_kwargs = dict(
                 to_email=assignee_email,
                 to_name=assignee_name,
                 issue_id=issue_id,
@@ -603,14 +652,14 @@ def _handle_new_message_inner(event):
                 ask_url=ask_url,
                 raiser_email=raiser_email,
             )
-            issues[issue_id]["thread_message_id"] = msg_id
+            threading.Thread(
+                target=_send_assignment_email_bg,
+                args=(issue_id, email_kwargs),
+                daemon=True,
+            ).start()
         else:
             print(f"Skipping email for {assignee_name} (not in whitelist)")
 
-        slack_ts = post_issue_notification(channel, issue_id, description, assignee_name, issue_type)
-        issues[issue_id]["slack_ts"] = slack_ts
-        _save_issues()
-        threading.Thread(target=log_issue, args=(dict(issues[issue_id]),), daemon=True).start()
         print(f"{issue_type} {issue_id} assigned to {assignee_name}")
 
 
@@ -623,11 +672,11 @@ def slack_actions():
     payload_type = payload.get("type")
 
     if payload_type == "block_actions":
-        action    = payload["actions"][0]
-        action_id = action["action_id"]
-        issue_id  = action["value"]
-        user_id   = payload["user"]["id"]
-        channel   = payload["channel"]["id"]
+        action     = payload["actions"][0]
+        action_id  = action["action_id"]
+        issue_id   = action["value"]
+        user_id    = payload["user"]["id"]
+        channel    = payload["channel"]["id"]
         trigger_id = payload.get("trigger_id", "")
 
         issue = issues.get(issue_id)
@@ -677,11 +726,11 @@ def slack_actions():
                     },
                 ],
             }
-            threading.Thread(
-                target=slack_client.views_open,
-                kwargs={"trigger_id": trigger_id, "view": modal_view},
-                daemon=True,
-            ).start()
+            # Call views_open synchronously — trigger_id has a 3-second expiry window
+            try:
+                slack_client.views_open(trigger_id=trigger_id, view=modal_view)
+            except Exception as e:
+                print(f"[ERROR] views_open failed for {issue_id}: {e}")
 
     elif payload_type == "view_submission":
         if payload["view"]["callback_id"] == "done_modal":
@@ -720,7 +769,7 @@ def email_action():
             f"</body></html>"
         ), 404
 
-    if action in ("accept", "assign"):  # keep "assign" for backward compat
+    if action in ("accept", "assign"):
         if issue["status"] in ("Accepted", "Resolved"):
             return _action_page("Already Accepted", issue_id, issue["status"], "#4A154B")
         threading.Thread(
@@ -751,7 +800,6 @@ def email_reassign_form():
         if issue["status"] == "Resolved":
             return _action_page("Already Resolved", issue_id, "Resolved", "#1D7A46")
 
-        # Build user dropdown (exclude current assignee)
         users = get_slack_users()
         options_html = "\n".join(
             f'<option value="{u["id"]}">{u["name"]} ({u["email"]})</option>'
@@ -761,7 +809,7 @@ def email_reassign_form():
 
         return f"""<html><body style="font-family:Arial,sans-serif;background:#f4f4f4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
         <div style="background:white;border-radius:10px;padding:40px;max-width:520px;width:90%;box-shadow:0 4px 16px rgba(0,0,0,0.1);">
-            <h2 style="color:#E67E22;margin:0 0 6px;">🔄 Reassign Task</h2>
+            <h2 style="color:#E67E22;margin:0 0 6px;">Reassign Task</h2>
             <p style="color:#666;margin:0 0 20px;font-size:14px;">
                 <strong>{issue_id}</strong> — {issue['description'][:100]}
             </p>
@@ -900,10 +948,9 @@ def email_ask_redirect():
     if not issue:
         return f"<h2>Issue {issue_id} not found</h2>", 404
 
-    raiser_id   = issue.get("raised_by_id", "")
-    raiser_name = issue.get("raised_by", "the raiser")
-    slack_url   = f"slack://user?team={SLACK_TEAM_ID}&id={raiser_id}" if SLACK_TEAM_ID and raiser_id else ""
-    fallback    = f"https://slack.com/app_redirect?channel={raiser_id}&team={SLACK_TEAM_ID}" if SLACK_TEAM_ID and raiser_id else ""
+    raiser_id = issue.get("raised_by_id", "")
+    slack_url = f"slack://user?team={SLACK_TEAM_ID}&id={raiser_id}" if SLACK_TEAM_ID and raiser_id else ""
+    fallback  = f"https://slack.com/app_redirect?channel={raiser_id}&team={SLACK_TEAM_ID}" if SLACK_TEAM_ID and raiser_id else ""
 
     return f"""<html>
     <head>
