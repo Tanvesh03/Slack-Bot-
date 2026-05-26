@@ -221,8 +221,8 @@ def generate_email_token(issue_id: str, action: str) -> str:
 
 
 def _issue_blocks(issue_id, assigned_to_name, description, status):
-    status_text = status if status else "—"
-    return [
+    status_text = status if status else "Pending"
+    blocks = [
         {
             "type": "section",
             "fields": [
@@ -233,6 +233,27 @@ def _issue_blocks(issue_id, assigned_to_name, description, status):
             ],
         }
     ]
+
+    if status != "Resolved":
+        elements = []
+        if status not in ("Accepted",):
+            elements.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Accept"},
+                "style": "primary",
+                "action_id": "accept_task",
+                "value": issue_id,
+            })
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Mark Done"},
+            "style": "primary",
+            "action_id": "done_task",
+            "value": issue_id,
+        })
+        blocks.append({"type": "actions", "elements": elements})
+
+    return blocks
 
 
 def post_issue_notification(channel, issue_id, description, assigned_to_name, issue_type):
@@ -293,6 +314,9 @@ def _process_accepted(issue_id, actor_name):
     issue["status"] = "Accepted"
     issue["working_started_time"] = now
 
+    # Update Slack instantly before slow operations
+    _update_slack_message(issue_id, "Accepted")
+
     update_issue_status(issue_id, "working_started_time", now)
     update_issue_status(issue_id, "status", "Accepted")
 
@@ -312,7 +336,6 @@ def _process_accepted(issue_id, actor_name):
         )
         issue["accept_message_id"] = accept_msg_id
 
-    _update_slack_message(issue_id, "Accepted")
     _save_issues()
     print(f"{issue_id} status -> Accepted by {actor_name}")
 
@@ -334,6 +357,9 @@ def _process_done(issue_id, completion_message, actor_name):
         issue["resolution_duration"] = f"{hours}h {remainder // 60}m"
     except Exception:
         issue["resolution_duration"] = "N/A"
+
+    # Update Slack instantly before slow operations
+    _update_slack_message(issue_id, "Resolved")
 
     update_issue_status(issue_id, "completion_time", now)
     update_issue_status(issue_id, "status", "Resolved")
@@ -360,7 +386,6 @@ def _process_done(issue_id, completion_message, actor_name):
             accept_message_id=accept_id,
         )
 
-    _update_slack_message(issue_id, "Resolved")
     _save_issues()
     print(f"{issue_id} status -> Resolved by {actor_name}")
 
@@ -478,7 +503,7 @@ def slack_events():
     if (
         event.get("type") == "message"
         and not event.get("bot_id")
-        and not event.get("subtype")
+        and event.get("subtype") in (None, "file_share")
     ):
         threading.Thread(target=handle_new_message, args=(event,), daemon=True).start()
 
@@ -495,6 +520,13 @@ def handle_new_message(event):
 
 
 def _handle_new_message_inner(event):
+    # Skip thread replies — only top-level messages create issues
+    thread_ts = event.get("thread_ts")
+    if thread_ts and thread_ts != event.get("ts"):
+        print(f"Skipped thread reply in {event.get('channel')}")
+        return
+
+    # Use only the typed text — ignore file/image attachment content
     text = event.get("text", "")
     channel = event.get("channel", "")
     user_id = event.get("user", "")
@@ -586,6 +618,85 @@ def _handle_new_message_inner(event):
 def slack_actions():
     if not signature_verifier.is_valid_request(request.get_data(), request.headers):
         return jsonify({"error": "Invalid signature"}), 403
+
+    payload = json.loads(request.form.get("payload", "{}"))
+    payload_type = payload.get("type")
+
+    if payload_type == "block_actions":
+        action    = payload["actions"][0]
+        action_id = action["action_id"]
+        issue_id  = action["value"]
+        user_id   = payload["user"]["id"]
+        channel   = payload["channel"]["id"]
+        trigger_id = payload.get("trigger_id", "")
+
+        issue = issues.get(issue_id)
+        if not issue:
+            return jsonify({"ok": True})
+
+        # Permission check — only the assigned person can act
+        if user_id != issue.get("assigned_to_id"):
+            slack_client.chat_postEphemeral(
+                channel=channel,
+                user=user_id,
+                text=f"Only *{issue['assigned_to']}* can take action on {issue_id}.",
+            )
+            return jsonify({"ok": True})
+
+        if action_id == "accept_task":
+            threading.Thread(
+                target=_process_accepted,
+                args=(issue_id, issue["assigned_to"]),
+                daemon=True,
+            ).start()
+
+        elif action_id == "done_task":
+            modal_view = {
+                "type": "modal",
+                "callback_id": "done_modal",
+                "private_metadata": json.dumps({"issue_id": issue_id}),
+                "title": {"type": "plain_text", "text": "Mark as Done"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*{issue_id}* — {issue['description'][:100]}"},
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "completion_block",
+                        "label": {"type": "plain_text", "text": "Completion Message"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "completion_message",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": "Briefly describe what was done..."},
+                            "min_length": 5,
+                        },
+                    },
+                ],
+            }
+            threading.Thread(
+                target=slack_client.views_open,
+                kwargs={"trigger_id": trigger_id, "view": modal_view},
+                daemon=True,
+            ).start()
+
+    elif payload_type == "view_submission":
+        if payload["view"]["callback_id"] == "done_modal":
+            metadata   = json.loads(payload["view"]["private_metadata"])
+            issue_id   = metadata["issue_id"]
+            completion = payload["view"]["state"]["values"]["completion_block"]["completion_message"]["value"]
+            issue      = issues.get(issue_id)
+            if issue:
+                threading.Thread(
+                    target=_process_done,
+                    args=(issue_id, completion, issue["assigned_to"]),
+                    daemon=True,
+                ).start()
+            return jsonify({})
+
     return jsonify({"ok": True})
 
 
