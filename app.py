@@ -154,12 +154,10 @@ SKIP_PHRASES = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_user_info(user_id):
-    # Check cache first — avoids a live Slack API call on every message
     with _users_cache_lock:
         for u in _users_cache:
             if u["id"] == user_id:
                 return u["name"], u["email"]
-    # Fallback to live API if not in cache yet (startup race or new user)
     try:
         res = slack_client.users_info(user=user_id)
         user = res["user"]
@@ -246,6 +244,27 @@ def generate_email_token(issue_id: str, action: str) -> str:
     return hmac_lib.new(key, f"{issue_id}:{action}".encode(), hashlib.sha256).hexdigest()[:20]
 
 
+def _get_candidates(issue):
+    """Return candidate list, falling back to single-assignee for old issues."""
+    candidates = issue.get("candidate_assignees")
+    if candidates:
+        return candidates
+    # Backward compat: old single-assignee issues
+    if issue.get("assigned_to_id") and issue.get("assigned_to_email"):
+        return [{"id": issue["assigned_to_id"], "name": issue["assigned_to"], "email": issue["assigned_to_email"]}]
+    return []
+
+
+def _get_candidate_ids(issue):
+    """Return list of valid actor IDs for this issue."""
+    ids = issue.get("candidate_assignee_ids")
+    if ids:
+        return ids
+    if issue.get("assigned_to_id"):
+        return [issue["assigned_to_id"]]
+    return []
+
+
 def _issue_blocks(issue_id, assigned_to_name, description, status):
     status_text = status if status else "Pending"
     blocks = [
@@ -307,16 +326,18 @@ def _update_slack_message(issue_id, status):
         print(f"Failed to update Slack message for {issue_id}: {e}")
 
 
-def _build_action_urls(public_url, issue_id, raiser_id=""):
+def _build_action_urls(public_url, issue_id, raiser_id="", actor_id=""):
+    """Build email action URLs. actor_id encodes who this email is addressed to."""
     if not public_url:
         return None, None, None, None
     accept_token   = generate_email_token(issue_id, "accept")
     reassign_token = generate_email_token(issue_id, "reassign")
     done_token     = generate_email_token(issue_id, "done")
     ask_token      = generate_email_token(issue_id, "ask")
-    ask_url = f"{public_url}/email/ask-redirect?issue_id={issue_id}&token={ask_token}"
+    actor_param    = f"&actor_id={actor_id}" if actor_id else ""
+    ask_url        = f"{public_url}/email/ask-redirect?issue_id={issue_id}&token={ask_token}"
     return (
-        f"{public_url}/email/action?issue_id={issue_id}&action=accept&token={accept_token}",
+        f"{public_url}/email/action?issue_id={issue_id}&action=accept&token={accept_token}{actor_param}",
         f"{public_url}/email/reassign-form?issue_id={issue_id}&token={reassign_token}",
         f"{public_url}/email/done-form?issue_id={issue_id}&token={done_token}",
         ask_url,
@@ -327,34 +348,54 @@ def _build_action_urls(public_url, issue_id, raiser_id=""):
 # PROCESSING FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _process_accepted(issue_id, actor_name):
+def _process_accepted(issue_id, actor_id):
     issue = issues.get(issue_id)
-    if not issue or issue["status"] in ("Accepted", "Resolved"):
+    if not issue:
+        return
+
+    # Guard: already accepted or resolved
+    if issue["status"] in ("Accepted", "Resolved"):
+        return
+    # Guard: race condition — another thread accepted first
+    if issue.get("assigned_to_id") and issue["assigned_to_id"] != actor_id:
+        return
+
+    # Resolve actor from candidate list
+    actor = next((c for c in _get_candidates(issue) if c["id"] == actor_id), None)
+    if actor is None:
+        print(f"[WARN] actor {actor_id} not a valid candidate for {issue_id}")
         return
 
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    issue["status"] = "Accepted"
+    issue["status"]              = "Accepted"
     issue["working_started_time"] = now
+    issue["assigned_to"]         = actor["name"]
+    issue["assigned_to_email"]   = actor["email"]
+    issue["assigned_to_id"]      = actor["id"]
 
-    # Update Slack card instantly — user sees change before any slow I/O
+    # Update Slack card instantly
     _update_slack_message(issue_id, "Accepted")
 
-    # Single Sheets API call for both fields
     batch_update_issue(issue_id, {
         "working_started_time": now,
-        "status": "Accepted",
+        "status":               "Accepted",
+        "assigned_to":          actor["name"],
     })
 
     sent = issue.setdefault("action_emails_sent", set())
-    thread_id = issue.get("thread_message_id")
+    # Use the per-actor thread_message_id for correct email threading
+    thread_id = (
+        issue.get("thread_message_ids", {}).get(actor_id)
+        or issue.get("thread_message_id")
+    )
     if "accepted" not in sent:
         sent.add("accepted")
         accept_msg_id = send_accepted_email(
-            to_email=issue["assigned_to_email"],
-            to_name=issue["assigned_to"],
+            to_email=actor["email"],
+            to_name=actor["name"],
             issue_id=issue_id,
             issue_text=issue["description"],
-            assignee_name=issue["assigned_to"],
+            assignee_name=actor["name"],
             raised_by=issue["raised_by"],
             raiser_email=issue["raised_by_email"] or None,
             original_message_id=thread_id,
@@ -362,40 +403,55 @@ def _process_accepted(issue_id, actor_name):
         issue["accept_message_id"] = accept_msg_id
 
     _save_issues()
-    print(f"{issue_id} -> Accepted by {actor_name}")
+    print(f"{issue_id} -> Accepted by {actor['name']}")
 
 
-def _process_done(issue_id, completion_message, actor_name):
+def _process_done(issue_id, completion_message, actor_id):
     issue = issues.get(issue_id)
     if not issue or issue["status"] == "Resolved":
         return
 
+    # If not yet accepted, the person clicking Done implicitly accepts
+    if not issue.get("assigned_to_id"):
+        actor = next((c for c in _get_candidates(issue) if c["id"] == actor_id), None)
+        if actor is None:
+            print(f"[WARN] actor {actor_id} not a valid candidate for {issue_id}")
+            return
+        issue["assigned_to"]       = actor["name"]
+        issue["assigned_to_email"] = actor["email"]
+        issue["assigned_to_id"]    = actor["id"]
+    elif issue["assigned_to_id"] != actor_id:
+        print(f"[WARN] {actor_id} tried to mark {issue_id} done but accepted by {issue['assigned_to']}")
+        return
+
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    issue["status"] = "Resolved"
-    issue["completion_time"] = now
+    issue["status"]             = "Resolved"
+    issue["completion_time"]    = now
     issue["completion_message"] = completion_message
 
     try:
         raised = datetime.strptime(issue["raised_time"], "%d %b %Y, %I:%M %p")
-        delta = datetime.strptime(now, "%d %b %Y, %I:%M %p") - raised
+        delta  = datetime.strptime(now, "%d %b %Y, %I:%M %p") - raised
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         issue["resolution_duration"] = f"{hours}h {remainder // 60}m"
     except Exception:
         issue["resolution_duration"] = "N/A"
 
-    # Update Slack card instantly — user sees change before any slow I/O
     _update_slack_message(issue_id, "Resolved")
 
-    # Single Sheets API call for all four fields
     batch_update_issue(issue_id, {
-        "completion_time": now,
-        "status": "Resolved",
+        "completion_time":    now,
+        "status":             "Resolved",
         "resolution_duration": issue["resolution_duration"],
         "completion_message": completion_message,
+        "assigned_to":        issue["assigned_to"],
     })
 
-    sent = issue.setdefault("action_emails_sent", set())
-    thread_id = issue.get("thread_message_id")
+    sent      = issue.setdefault("action_emails_sent", set())
+    thread_id = (
+        issue.get("thread_message_ids", {}).get(actor_id)
+        or issue.get("thread_message_id")
+    )
     accept_id = issue.get("accept_message_id")
     if "resolved" not in sent:
         sent.add("resolved")
@@ -415,7 +471,7 @@ def _process_done(issue_id, completion_message, actor_name):
         )
 
     _save_issues()
-    print(f"{issue_id} -> Resolved by {actor_name}")
+    print(f"{issue_id} -> Resolved by {issue['assigned_to']}")
 
 
 def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
@@ -428,7 +484,7 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
         print(f"[WARN] No email for new assignee {new_assignee_id}")
         return
 
-    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    now                = datetime.now().strftime("%d %b %Y, %I:%M %p")
     old_assignee_name  = issue["assigned_to"]
     old_assignee_email = issue["assigned_to_email"]
 
@@ -440,13 +496,15 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
     issue["assigned_to_id"]      = new_assignee_id
     issue["status"]              = ""
     issue["working_started_time"] = ""
+    # Reset candidate list to just the new assignee
+    issue["candidate_assignee_ids"] = [new_assignee_id]
+    issue["candidate_assignees"]    = [{"id": new_assignee_id, "name": new_assignee_name, "email": new_assignee_email}]
+    issue["thread_message_ids"]     = {}
     issue.setdefault("action_emails_sent", set()).discard("accepted")
     issue["action_emails_sent"].discard("resolved")
 
-    # Update Slack card instantly — user sees change before any slow I/O
     _update_slack_message(issue_id, "Reassigned")
 
-    # Single Sheets API call for all five fields
     batch_update_issue(issue_id, {
         "assigned_to":         new_assignee_name,
         "reassigned_from":     old_assignee_name,
@@ -457,7 +515,7 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
 
     public_url = get_public_url()
     accept_url, reassign_url, done_url, ask_url = _build_action_urls(
-        public_url, issue_id, issue.get("raised_by_id", "")
+        public_url, issue_id, issue.get("raised_by_id", ""), actor_id=new_assignee_id
     )
     thread_id = issue.get("thread_message_id")
 
@@ -480,6 +538,7 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
             reassignment_reason=reason,
         )
         issue["thread_message_id"] = new_msg_id
+        issue["thread_message_ids"][new_assignee_id] = new_msg_id
 
         send_reassign_notification_email(
             to_email=issue["raised_by_email"],
@@ -500,12 +559,15 @@ def _process_reassign(issue_id, new_assignee_id, reason, actor_name):
     print(f"{issue_id} reassigned from {old_assignee_name} -> {new_assignee_name}")
 
 
-def _send_assignment_email_bg(issue_id, email_kwargs):
-    """Background helper: send assignment email and store thread_message_id."""
+def _send_assignment_email_bg(issue_id, actor_id, email_kwargs):
+    """Send assignment email in background and store thread_message_id for this actor."""
     try:
         msg_id = send_assignment_email(**email_kwargs)
         if issue_id in issues:
-            issues[issue_id]["thread_message_id"] = msg_id
+            issues[issue_id].setdefault("thread_message_ids", {})[actor_id] = msg_id
+            # Keep thread_message_id for backward compat (first email wins)
+            if not issues[issue_id].get("thread_message_id"):
+                issues[issue_id]["thread_message_id"] = msg_id
             _save_issues()
     except Exception as e:
         print(f"[ERROR] Assignment email failed for {issue_id}: {e}")
@@ -533,7 +595,7 @@ def slack_events():
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload["challenge"]})
 
-    event = payload.get("event", {})
+    event    = payload.get("event", {})
     event_id = payload.get("event_id", "")
 
     with _event_ids_lock:
@@ -562,15 +624,15 @@ def handle_new_message(event):
 
 
 def _handle_new_message_inner(event):
-    # Skip thread replies — only top-level messages create issues
+    # Skip thread replies
     thread_ts = event.get("thread_ts")
     if thread_ts and thread_ts != event.get("ts"):
         print(f"Skipped thread reply in {event.get('channel')}")
         return
 
-    text = event.get("text", "")
-    channel = event.get("channel", "")
-    user_id = event.get("user", "")
+    text      = event.get("text", "")
+    channel   = event.get("channel", "")
+    user_id   = event.get("user", "")
     timestamp = event.get("ts", "")
 
     mentions = extract_mentions(text)
@@ -583,63 +645,76 @@ def _handle_new_message_inner(event):
 
     raiser_name, raiser_email = get_user_info(user_id)
     channel_name = get_channel_name(channel)
-    raised_time = datetime.fromtimestamp(float(timestamp)).strftime("%d %b %Y, %I:%M %p")
-    description = clean_slack_text(text)
-    issue_type = get_issue_type(text)
-    public_url = get_public_url()
-    print(f"Raiser: {raiser_name} | Channel: {channel_name} | URL: {public_url}")
+    raised_time  = datetime.fromtimestamp(float(timestamp)).strftime("%d %b %Y, %I:%M %p")
+    description  = clean_slack_text(text)
+    issue_type   = get_issue_type(text)
+    public_url   = get_public_url()
 
+    # Resolve all mentioned users first
+    candidates = []
     for assignee_id in mentions:
-        assignee_name, assignee_email = get_user_info(assignee_id)
-        print(f"Assignee: {assignee_name} <{assignee_email}>")
-        if not assignee_email:
-            print(f"[WARN] No email for {assignee_id} ({assignee_name})")
+        a_name, a_email = get_user_info(assignee_id)
+        if not a_email:
+            print(f"[WARN] No email for {assignee_id} ({a_name}), skipping")
             continue
+        candidates.append({"id": assignee_id, "name": a_name, "email": a_email})
 
-        issue_id = generate_issue_id()
-        accept_url, reassign_url, done_url, ask_url = _build_action_urls(public_url, issue_id, user_id)
+    if not candidates:
+        return
 
-        issues[issue_id] = {
-            "issue_id": issue_id,
-            "description": description,
-            "issue_type": issue_type,
-            "raised_by": raiser_name,
-            "raised_by_id": user_id,
-            "raised_by_email": raiser_email,
-            "assigned_to": assignee_name,
-            "assigned_to_email": assignee_email,
-            "assigned_to_id": assignee_id,
-            "channel": channel_name,
-            "channel_id": channel,
-            "raised_time": raised_time,
-            "working_started_time": "",
-            "completion_time": "",
-            "completion_message": "",
-            "status": "",
-            "resolution_duration": "",
-            "reassigned_from": "",
-            "reassignment_reason": "",
-            "reassignment_time": "",
-            "raised_ts": timestamp,
-            "action_emails_sent": set(),
-            "thread_message_id": None,
-            "accept_message_id": None,
-            "slack_ts": None,
-        }
+    # ONE issue for all candidates — shared task card
+    issue_id            = generate_issue_id()
+    assigned_to_display = " / ".join(c["name"] for c in candidates)
 
-        # Post Slack card immediately — don't wait for email
-        slack_ts = post_issue_notification(channel, issue_id, description, assignee_name, issue_type)
-        issues[issue_id]["slack_ts"] = slack_ts
-        _save_issues()
+    issues[issue_id] = {
+        "issue_id":              issue_id,
+        "description":           description,
+        "issue_type":            issue_type,
+        "raised_by":             raiser_name,
+        "raised_by_id":          user_id,
+        "raised_by_email":       raiser_email,
+        "assigned_to":           assigned_to_display,  # all names; updated on acceptance
+        "assigned_to_email":     "",                   # set when first person accepts
+        "assigned_to_id":        "",                   # set when first person accepts
+        "candidate_assignee_ids": [c["id"] for c in candidates],
+        "candidate_assignees":    candidates,
+        "channel":               channel_name,
+        "channel_id":            channel,
+        "raised_time":           raised_time,
+        "working_started_time":  "",
+        "completion_time":       "",
+        "completion_message":    "",
+        "status":                "",
+        "resolution_duration":   "",
+        "reassigned_from":       "",
+        "reassignment_reason":   "",
+        "reassignment_time":     "",
+        "raised_ts":             timestamp,
+        "action_emails_sent":    set(),
+        "thread_message_id":     None,
+        "thread_message_ids":    {},  # {actor_id: message_id}
+        "accept_message_id":     None,
+        "slack_ts":              None,
+    }
 
-        # Log to Sheets in background
-        threading.Thread(target=log_issue, args=(dict(issues[issue_id]),), daemon=True).start()
+    print(f"Raiser: {raiser_name} | Candidates: {assigned_to_display} | URL: {public_url}")
 
-        # Send assignment email in background — saves thread_message_id when done
-        if assignee_name in EMAIL_WHITELIST:
+    # Post ONE shared Slack card immediately
+    slack_ts = post_issue_notification(channel, issue_id, description, assigned_to_display, issue_type)
+    issues[issue_id]["slack_ts"] = slack_ts
+    _save_issues()
+
+    threading.Thread(target=log_issue, args=(dict(issues[issue_id]),), daemon=True).start()
+
+    # Send individual emails to each candidate (each email has their own actor_id in the accept URL)
+    for candidate in candidates:
+        if candidate["name"] in EMAIL_WHITELIST:
+            accept_url, reassign_url, done_url, ask_url = _build_action_urls(
+                public_url, issue_id, user_id, actor_id=candidate["id"]
+            )
             email_kwargs = dict(
-                to_email=assignee_email,
-                to_name=assignee_name,
+                to_email=candidate["email"],
+                to_name=candidate["name"],
                 issue_id=issue_id,
                 issue_text=description,
                 raised_by=raiser_name,
@@ -654,13 +729,13 @@ def _handle_new_message_inner(event):
             )
             threading.Thread(
                 target=_send_assignment_email_bg,
-                args=(issue_id, email_kwargs),
+                args=(issue_id, candidate["id"], email_kwargs),
                 daemon=True,
             ).start()
         else:
-            print(f"Skipping email for {assignee_name} (not in whitelist)")
+            print(f"Skipping email for {candidate['name']} (not in whitelist)")
 
-        print(f"{issue_type} {issue_id} assigned to {assignee_name}")
+    print(f"{issue_type} {issue_id} assigned to {assigned_to_display}")
 
 
 @app.route("/slack/actions", methods=["POST"])
@@ -668,7 +743,7 @@ def slack_actions():
     if not signature_verifier.is_valid_request(request.get_data(), request.headers):
         return jsonify({"error": "Invalid signature"}), 403
 
-    payload = json.loads(request.form.get("payload", "{}"))
+    payload      = json.loads(request.form.get("payload", "{}"))
     payload_type = payload.get("type")
 
     if payload_type == "block_actions":
@@ -683,30 +758,56 @@ def slack_actions():
         if not issue:
             return jsonify({"ok": True})
 
-        # Permission check — only the assigned person can act
-        if user_id != issue.get("assigned_to_id"):
-            slack_client.chat_postEphemeral(
-                channel=channel,
-                user=user_id,
-                text=f"Only *{issue['assigned_to']}* can take action on {issue_id}.",
-            )
-            return jsonify({"ok": True})
+        candidate_ids = _get_candidate_ids(issue)
 
         if action_id == "accept_task":
+            # Must be a candidate
+            if user_id not in candidate_ids:
+                slack_client.chat_postEphemeral(
+                    channel=channel, user=user_id,
+                    text=f"You are not assigned to {issue_id}.",
+                )
+                return jsonify({"ok": True})
+            # Check if someone else already accepted
+            current_accepter = issue.get("assigned_to_id")
+            if current_accepter and current_accepter != user_id:
+                slack_client.chat_postEphemeral(
+                    channel=channel, user=user_id,
+                    text=f"*{issue['assigned_to']}* already accepted {issue_id}.",
+                )
+                return jsonify({"ok": True})
+
             threading.Thread(
                 target=_process_accepted,
-                args=(issue_id, issue["assigned_to"]),
+                args=(issue_id, user_id),
                 daemon=True,
             ).start()
 
         elif action_id == "done_task":
+            current_accepter = issue.get("assigned_to_id")
+            if current_accepter and current_accepter != user_id:
+                # Task already accepted by someone else
+                slack_client.chat_postEphemeral(
+                    channel=channel, user=user_id,
+                    text=f"Only *{issue['assigned_to']}* can mark {issue_id} as done.",
+                )
+                return jsonify({"ok": True})
+            if not current_accepter and user_id not in candidate_ids:
+                # Not a candidate at all
+                slack_client.chat_postEphemeral(
+                    channel=channel, user=user_id,
+                    text=f"Only assigned team members can take action on {issue_id}.",
+                )
+                return jsonify({"ok": True})
+
             modal_view = {
                 "type": "modal",
                 "callback_id": "done_modal",
-                "private_metadata": json.dumps({"issue_id": issue_id}),
-                "title": {"type": "plain_text", "text": "Mark as Done"},
+                # Store actor_id so view_submission knows who submitted
+                "private_metadata": json.dumps({"issue_id": issue_id, "actor_id": user_id}),
+                "title":  {"type": "plain_text", "text": "Mark as Done"},
                 "submit": {"type": "plain_text", "text": "Submit"},
-                "close": {"type": "plain_text", "text": "Cancel"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
                 "blocks": [
                     {
                         "type": "section",
@@ -726,7 +827,7 @@ def slack_actions():
                     },
                 ],
             }
-            # Call views_open synchronously — trigger_id has a 3-second expiry window
+            # Synchronous — trigger_id has a 3-second expiry window
             try:
                 slack_client.views_open(trigger_id=trigger_id, view=modal_view)
             except Exception as e:
@@ -736,12 +837,13 @@ def slack_actions():
         if payload["view"]["callback_id"] == "done_modal":
             metadata   = json.loads(payload["view"]["private_metadata"])
             issue_id   = metadata["issue_id"]
+            actor_id   = metadata.get("actor_id", "")
             completion = payload["view"]["state"]["values"]["completion_block"]["completion_message"]["value"]
             issue      = issues.get(issue_id)
             if issue:
                 threading.Thread(
                     target=_process_done,
-                    args=(issue_id, completion, issue["assigned_to"]),
+                    args=(issue_id, completion, actor_id),
                     daemon=True,
                 ).start()
             return jsonify({})
@@ -754,6 +856,7 @@ def email_action():
     issue_id = request.args.get("issue_id", "")
     action   = request.args.get("action", "")
     token    = request.args.get("token", "")
+    actor_id = request.args.get("actor_id", "")
 
     if not all([issue_id, action, token]):
         return "<h2>Invalid request</h2>", 400
@@ -772,9 +875,24 @@ def email_action():
     if action in ("accept", "assign"):
         if issue["status"] in ("Accepted", "Resolved"):
             return _action_page("Already Accepted", issue_id, issue["status"], "#4A154B")
+
+        # Validate the actor is a legitimate candidate
+        candidate_ids = _get_candidate_ids(issue)
+        effective_actor = actor_id if actor_id in candidate_ids else issue.get("assigned_to_id", "")
+        if not effective_actor:
+            return "<h2>Invalid accept link.</h2>", 403
+
+        # Check if someone else already accepted
+        current_accepter = issue.get("assigned_to_id")
+        if current_accepter and current_accepter != effective_actor:
+            return _action_page(
+                f"Already Accepted by {issue['assigned_to']}",
+                issue_id, "Accepted", "#4A154B"
+            )
+
         threading.Thread(
             target=_process_accepted,
-            args=(issue_id, issue["assigned_to"]),
+            args=(issue_id, effective_actor),
             daemon=True,
         ).start()
         return _action_page("Task Accepted", issue_id, "Accepted", "#4A154B")
@@ -907,7 +1025,7 @@ def email_done_form():
         </div>
         </body></html>"""
 
-    # POST
+    # POST — actor is whoever accepted (or the person using the done link)
     issue_id           = request.form.get("issue_id", "")
     token              = request.form.get("token", "")
     completion_message = request.form.get("completion_message", "").strip()
@@ -925,9 +1043,14 @@ def email_done_form():
     if issue["status"] == "Resolved":
         return _action_page("Already Resolved", issue_id, "Resolved", "#1D7A46")
 
+    # For email-done, the actor is whoever accepted; fall back to first candidate
+    actor_id = issue.get("assigned_to_id") or (
+        issue.get("candidate_assignee_ids", [None])[0]
+    )
+
     threading.Thread(
         target=_process_done,
-        args=(issue_id, completion_message, issue["assigned_to"]),
+        args=(issue_id, completion_message, actor_id),
         daemon=True,
     ).start()
 
