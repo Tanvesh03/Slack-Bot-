@@ -49,21 +49,26 @@ def main():
     print("  StayVista Slack Issue Bot")
     print("=" * 60)
 
-    # Step 1: Get or start ngrok tunnel
-    print("\n[1/2] Setting up ngrok tunnel...")
-    public_url = _get_ngrok_url()
-
+    # On Railway/production PUBLIC_URL is set — skip ngrok entirely
+    public_url = os.environ.get("PUBLIC_URL", "").strip()
     if public_url:
-        print(f"      [OK] Using existing tunnel: {public_url}")
+        if not public_url.startswith("https://"):
+            public_url = "https://" + public_url
+        print(f"\n[OK] Production mode — URL: {public_url}")
     else:
-        public_url = _start_ngrok()
+        # Local development — set up ngrok tunnel
+        print("\n[1/2] Setting up ngrok tunnel...")
+        public_url = _get_ngrok_url()
         if public_url:
-            print(f"      [OK] ngrok tunnel active: {public_url}")
+            print(f"      [OK] Using existing tunnel: {public_url}")
         else:
-            print(f"      Run ngrok manually: ngrok http {PORT}")
+            public_url = _start_ngrok()
+            if public_url:
+                print(f"      [OK] ngrok tunnel active: {public_url}")
+            else:
+                print(f"      Run ngrok manually: ngrok http {PORT}")
 
-    # Step 2: Print Slack config URLs
-    print("\n[2/2] Slack configuration:")
+    print("\nSlack configuration:")
     print("-" * 60)
     if public_url:
         print(f"  Event Subscriptions URL:  {public_url}/slack/events")
@@ -73,7 +78,6 @@ def main():
     print("-" * 60)
     print("\nBot is live. Press Ctrl+C to stop.\n")
 
-    # Run Flask in main thread (keeps process alive)
     from app import app
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
