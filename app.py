@@ -262,9 +262,19 @@ def is_acknowledgment(text):
     clean = re.sub(r"[!.,?]", "", clean).strip()
     if not clean:
         return True
-    if len(clean) > 100:
+    # Strip trailing sign-off words so "Please check this. Thanks." isn't skipped
+    clean = re.sub(r"\b(thanks|thank you|thank u|thnks|thx)\s*$", "", clean).strip()
+    if not clean:
+        return True
+    if len(clean) > 80:
         return False
-    return any(phrase in clean for phrase in SKIP_PHRASES)
+    # Remove all skip phrases (longest first) and see if anything meaningful remains
+    remaining = clean
+    for phrase in sorted(SKIP_PHRASES, key=len, reverse=True):
+        remaining = re.sub(r"\b" + re.escape(phrase) + r"\b", "", remaining)
+    # Strip leftover connectors and whitespace
+    remaining = re.sub(r"[\s,\-/]+", "", remaining).strip()
+    return len(remaining) == 0
 
 
 def clean_slack_text(text):
