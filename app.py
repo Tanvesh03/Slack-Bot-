@@ -123,6 +123,66 @@ def _schedule_users_cache():
 
 threading.Thread(target=_schedule_users_cache, daemon=True).start()
 
+# ── Startup backfill — recover missed messages while bot was offline ──────────
+BACKFILL_HOURS = int(os.environ.get("BACKFILL_HOURS", 24))
+
+
+def _backfill_missed_messages():
+    """On startup, scan recent channel history and create issues for any
+    @mention messages that were missed while the bot was offline."""
+    import time
+    time.sleep(8)  # wait for users cache to populate first
+
+    # Build set of already-tracked message timestamps
+    known_ts = {iss.get("raised_ts") for iss in issues.values() if iss.get("raised_ts")}
+
+    # Collect all channels from existing issues
+    known_channels = {iss["channel_id"] for iss in issues.values() if iss.get("channel_id")}
+
+    if not known_channels:
+        print("Backfill: no channels to scan")
+        return
+
+    oldest = str(datetime.now().timestamp() - BACKFILL_HOURS * 3600)
+    total_missed = 0
+
+    for channel_id in known_channels:
+        try:
+            result = slack_client.conversations_history(
+                channel=channel_id,
+                oldest=oldest,
+                limit=200,
+            )
+            for msg in result.get("messages", []):
+                ts = msg.get("ts", "")
+                if ts in known_ts:
+                    continue
+                if msg.get("bot_id"):
+                    continue
+                thread_ts = msg.get("thread_ts")
+                if thread_ts and thread_ts != ts:
+                    continue
+                if msg.get("subtype") not in (None, "file_share"):
+                    continue
+                text = msg.get("text", "")
+                if not re.findall(r"<@([A-Z0-9]+)>", text):
+                    continue
+                # Process as a missed message
+                print(f"Backfill: processing missed message ts={ts} in {channel_id}")
+                _handle_new_message_inner(msg)
+                known_ts.add(ts)
+                total_missed += 1
+        except Exception as e:
+            print(f"[WARN] Backfill failed for {channel_id}: {e}")
+
+    if total_missed:
+        print(f"Backfill complete: recovered {total_missed} missed message(s)")
+    else:
+        print(f"Backfill complete: no missed messages in last {BACKFILL_HOURS}h")
+
+
+threading.Thread(target=_backfill_missed_messages, daemon=True).start()
+
 # ── Channel name cache ────────────────────────────────────────────────────────
 _channel_cache = {}
 
